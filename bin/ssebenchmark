@@ -1,0 +1,155 @@
+#!/usr/bin/env ruby
+
+#    Copyright (c)2012 Tech-Angels
+# 
+#    This file is part of SSEBenchmark.
+#
+#    SSEBenchmark is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    SSEBenchmark is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with SSEBenchmark.  If not, see <http://www.gnu.org/licenses/>. 2
+
+
+
+require 'bundler'
+require 'active_support/json'
+require 'eventmachine'
+require 'em-eventsource'
+require 'optparse'
+
+module SSEBenchmark
+  @all_latencies = []
+  def get_latencies
+    @all_latencies
+  end
+
+  @options = {
+    pub_url: 'http://localhost/pub/ssebenchmark', 
+    sub_url: 'http://localhost/ev/ssebenchmark',
+    debug: false,
+    nb_clients: 1,
+    nb_messages: 10,
+    payload_size: 100,
+  }
+
+  OptionParser.new do |opts|
+    opts.on '-c', '--concurrency NUMBER', 'Number of clients' do |k|
+      @options[:nb_clients] = k.to_i
+    end
+
+    opts.on '-n', '--messages NUMBER', 'Number of messages' do |k|
+      @options[:nb_messages] = k.to_i
+    end
+
+    opts.on '-p', '--pub URL', "Publication URL (Default: " + @options[:pub_url] + ")" do |p|
+      @options[:pub_url] = p
+    end
+
+    opts.on '-s', '--sub URL', "Subcription URL (Default: " + @options[:sub_url] + ")" do |p|
+      @options[:sub_url]= p
+    end
+
+    opts.on '--size NUMBER', 'Payload size in bytes. (Default: ' + @options[:payload_size].to_s + ')' do |s|
+      @options[:payload_size] = s.to_i
+    end
+  end.parse!
+
+  def new_source
+    source = EM::EventSource.new(@options[:sub_url])
+    source.error { |e|
+      puts "Event source error: " + e.to_s
+      EM.stop
+    }
+
+    return source
+  end
+  
+  def get_stats(latencies)
+    lowest = latencies.min * 1000
+    highest = latencies.max * 1000
+    total = latencies.inject(:+) * 1000
+    len = latencies.length
+    average = total.to_f / len
+    sorted = latencies.sort
+    median = (len % 2 == 1 ? sorted[len/2] : (sorted[len / 2 - 1] + sorted[len / 2]).to_f / 2) * 1000
+    return {
+      min: lowest,
+      mean: average,
+      median: median,
+      max: highest
+    }
+  end
+
+  def run
+    latencies  = []
+    client_who_received = 0
+    messages_to_send = @options[:nb_messages].to_i
+    puts "Latency (ms)"
+    puts "min\tmean\tmedian\tmax"
+ 
+    EM.run do
+      # Connect clients
+      (1..@options[:nb_clients]).each do
+        source = new_source
+
+        source.message do |message|
+          now = Time.now.to_f
+          data = JSON.parse(message) 
+          if data.has_key?('time')
+            latency = now - data['time']
+            latencies << latency
+            client_who_received += 1
+          end
+          if client_who_received >= @options[:nb_clients] then
+            # Display statistics
+            stats = get_stats(latencies)
+            puts "%.2f\t%.2f\t%.2f\t%.2f" % [stats[:min], stats[:mean], stats[:median], stats[:max]] 
+            @all_latencies += latencies
+          end
+        end
+
+        source.start
+
+      end
+      # Send messages to the channel
+      EM::PeriodicTimer.new(1) do 
+        if messages_to_send > 0
+          client_who_received = 0
+          latencies  = []
+          http = EventMachine::HttpRequest.new(@options[:pub_url]).post(body: { time: Time.now.to_f, payload: " " * @options[:payload_size] }.to_json )
+          http.errback { |e|
+            puts "Error during POST: " + e.to_s
+            EM.stop
+          }
+          messages_to_send -= 1
+        else
+          EM.stop
+        end
+      end
+    end
+  end
+
+  extend self
+end
+
+begin
+  SSEBenchmark.run
+rescue SystemExit, Interrupt
+end
+
+# Print final stats
+stats = SSEBenchmark.get_stats(SSEBenchmark.get_latencies)
+puts "\n\nOverall latencies (ms)"
+puts "min\tmean\tmedian\tmax"
+puts "%.2f\t%.2f\t%.2f\t%.2f" % [stats[:min], stats[:mean], stats[:median], stats[:max]] 
+ 
+
+
